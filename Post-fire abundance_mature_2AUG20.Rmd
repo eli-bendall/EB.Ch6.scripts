@@ -1,0 +1,1991 @@
+---
+title: "post-fire abundance_mature"
+author: "E Bendall & M Bedward"
+date: "02/08/2020"
+output: word_document
+---
+
+
+```{r setup, include=TRUE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6)
+
+library(here)
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(readxl)
+library(stringr)
+library(tidyr)
+library(bayesplot)
+library(brms)
+library(purrr)
+library(forcats)
+library(modelr)
+library(tidybayes)
+library(RColorBrewer)
+library(rstan)
+library(loo)
+library(runjags)
+
+
+
+
+#These options help Stan run faster:
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Make sure the scales package is available (it should be if ggplot is installed)
+requireNamespace("scales")
+
+# Default graph theme - white background
+theme_set( theme_bw() )
+
+set.seed(42)
+
+
+# Set to TRUE to force models to be refitted
+REFIT_MODELS <- FALSE
+
+
+# Create a folder for fitted models if one does not already exist
+FittedModelsPath <- here("fitted_models")
+if (!dir.exists(FittedModelsPath)) {
+  dir.create(FittedModelsPath)
+}
+
+
+# Load brms if it is installed (requires Stan software and the rstan package).
+# If not installed, HAS_BRMS will be set to FALSE.
+HAS_BRMS <- suppressWarnings(
+  require("brms", quietly = TRUE)
+)
+
+
+###### Some helper functions #####
+
+# Calculate standard page sizes
+pagesize <- function(size = c("A4", "A3", "A2", "A1", "A0"), 
+                     orientation = c("portrait", "landscape"),
+                     units = c("cm", "mm")) {
+  
+  size <- match.arg(size)
+  orientation <- match.arg(orientation)
+  units <- match.arg(units)
+  
+  alpha <- 1000 * 2^(1/4)
+  i <- as.integer(substr(size, 2, 2))
+  long <- alpha * 2^(-i/2)
+  
+  page <- switch(
+    orientation,
+    portrait = c(width = long / sqrt(2), height = long),
+    landscape = c(width = long, height = long / sqrt(2))
+  )
+  
+  page <- round(page)
+  if (units == "cm") page <- page / 10
+  
+  page <- c(as.list(page), units = units)
+  class(page) <- "pagesize"
+  
+  page
+}
+
+
+
+# Save a graph to a PDF file
+gg_pdf <- function(plot, filename, size = pagesize("A4", "landscape", "cm")) {
+  
+  if (!inherits(size, "pagesize")) stop("The size argument should be a pagesize (list) object")
+  
+  ggsave(
+    filename, 
+    plot, 
+    width = size$width,
+    height = size$height,
+    units = size$units)
+}
+
+
+# Calculate highest posterior density interval for a vector of values
+hpdi.vec <- function (x, prob = 0.95) {
+  n <- length(x)
+  if (n <= 1) stop("x must have more than 1 element")
+  x <- sort(x)
+
+  gap <- max(1, min(n - 1, round(n * prob)))
+  init <- 1:(n - gap)
+
+  inds <- which.min(x[init + gap] - x[init])
+
+  out <- c(lower = x[inds], upper = x[inds + gap])
+  out
+}
+
+
+```
+
+## Prepare data 
+
+All field data are in a single Excel workbook.
+
+```{r}
+
+ExcelPathData <- here("data_raw", "Eli_field_data30thMAY.xlsx")
+
+ExcelPathBarkTypes <- here("data_raw", "bark3.xlsx")
+
+```
+
+
+### DBH class definitions (to be used for checking)
+
+```{r}
+
+DBH.classes <- data.frame(
+  class = 1:4,
+  dbh.min = c(0, 2.5, 10, 20)
+)
+
+knitr::kable(DBH.classes)
+
+```
+
+
+
+
+### Recruit levels
+
+This look-up table relates field codes for topkill to aggregated classes that will be used for modelling.
+
+```{r}
+
+# Resprout model levels in order of response severity (low to high)
+recruitLevels <- data.frame(
+  
+  level = c('l',        'c',        'e',        'd',    'ns'),
+  
+  label = c('resprout', 'resprout', 'resprout', 'dead', 'recruit') )
+
+knitr::kable(recruitLevels)
+
+
+dbhLevels <- data.frame(
+  level = c('4',       '3',           '2',       '1'),
+
+  label = c('mature',  'pole-sized',  'sapling', 'juvenile') )
+
+knitr::kable(dbhLevels)
+
+
+
+```
+
+
+### Small trees
+
+```{r}
+dat12 <- read_excel(ExcelPathData, sheet = "class1_2", guess_max = 5000) %>%
+  select(siteid = site_id,
+         treeid = tree_id,
+         species,
+         dbhclass = class,
+         dbh:dbh5,
+         r_type) %>%
+  
+  
+  # Add Excel row number (useful to locate records for checking)
+  mutate(xlrow = row_number() + 1) %>%
+
+  
+  # Attach labels/
+  mutate(recruit = factor(r_type, ordered = TRUE,
+                      levels = recruitLevels$level,
+                      labels = recruitLevels$label)) %>%
+
+  
+    # filter out missing records
+  filter(!is.na(r_type)) %>%
+  filter(recruit != "dead")
+
+# for some strange reason dbh for small trees is being read in as chracter and must be   converted here. Probably something to do with excel sheet, but upon checking this is not apparent
+
+dat12$dbh <- as.numeric(as.character(dat12$dbh))
+
+  
+```
+
+
+Check for missing values
+
+```{r}
+colSums( is.na(dat12) )
+```
+
+
+Calculate single-stem DBH
+
+```{r}
+
+# Function to calculate equivalent single-stem DBH
+fn_dbh <- function(...) {
+  dbhs <- cbind(...)
+  sqrt( rowSums(dbhs^2, na.rm = TRUE) )
+}
+
+dat12 <- dat12 %>% 
+  mutate(dbhsingle = fn_dbh(dbh, dbh2, dbh3, dbh4, dbh5)) %>%
+  
+  ## delete unused DBH columns
+  
+ dplyr::select(-(dbh:dbh5))
+
+
+
+```
+
+### Large trees
+
+```{r}
+
+dat34 <- read_excel(ExcelPathData, sheet = "class3_4", guess_max = 2604) %>%
+  
+  select(siteid = site_id,
+         treeid = tree_id,
+         species,
+         r_type,
+         dbhclass = class,
+         dbh:dbh7) %>%
+  
+  # Add Excel row number (useful to locate records for checking)
+  mutate(xlrow = row_number() + 1) %>%
+
+  
+    # Attach labels/
+  mutate(recruit = factor(r_type, ordered = TRUE,
+                      levels = recruitLevels$level,
+                      labels = recruitLevels$label)) %>%
+
+  #filter missing values
+  filter(!is.na(recruit)) %>%
+  filter(recruit != "dead") %>%
+  filter(!is.na(r_type))
+
+  
+
+```
+
+
+Check for missing values. It is okay to have NAs in the additional dbh columns: dbh2...dbh7
+
+```{r}
+colSums( is.na(dat34) )
+```
+
+
+For multi-stemmed trees, we calculate an equivalent single-stem diameter based on the sum of the areas of the multiple stems.
+
+```{r}
+
+# Function to calculate equivalent single-stem DBH
+fn_dbh <- function(...) {
+  dbhs <- cbind(...)
+  sqrt( rowSums(dbhs^2, na.rm = TRUE) )
+}
+
+dat34 <- dat34 %>% 
+  mutate(dbhsingle = fn_dbh(dbh, dbh2, dbh3, dbh4, dbh5, dbh6, dbh7)) %>%
+  
+  ## delete unused DBH columns
+  
+  select(-(dbh:dbh7))
+
+```
+
+
+Check for any trees where the single-stem DBH is below the lower threshold for the recorded DBH class. This might indicate a data entry error. For multi-stem trees, the calculated single-stem diameter is always greater than the largest individual stem diameter.
+
+```{r}
+
+small34 <- dat34 %>%
+  left_join(DBH.classes, by = c("dbhclass" = "class")) %>%
+  filter(dbhsingle < dbh.min) %>%
+  select(-dbh.min)
+
+if (nrow(small34) > 0) {
+  knitr::kable(small34)
+} else {
+  cat("No trees with suspect diameters found")
+}
+
+```
+
+*TODO* Eli will check the above records. For the moment we will discard them. ### UPDATED - checked by Eli, some records were fixed for large trees, some records for small trees were missing observations
+
+```{r}
+
+if (nrow(small34) > 0) {
+  dat34 <- dat34 %>%
+    filter( !(xlrow %in% small34$xlrow) )
+}
+
+```
+
+
+
+```{r}
+na0 <- function(x) ifelse(is.na(x), 0, x)
+
+DAT.all.trees <- bind_rows(
+  mutate(dat12, source = "dat12"),
+  mutate(dat34, source = "dat34")) %>%
+
+  # Re-arrange columns a bit
+  select(xlrow, treeid, species, starts_with("dbh"), everything()) %>%
+
+  
+  # Guard against mis-matched species names due to
+  # case or spaces
+  mutate(species = str_to_title( str_remove_all(species, "\\s+") ) )
+
+```
+
+
+
+Check for missing values
+
+```{r}
+
+colSums( is.na(DAT.all.trees) )
+
+```
+
+
+
+
+## Species summary
+
+This generates a summary table showing the number of occurrences (sites) for each DBH class by species.
+
+```{r}
+
+species.summary <- DAT.all.trees %>%
+  group_by(species, dbhclass) %>%
+  summarize(ntrees = n_distinct(treeid)) %>%
+  
+  mutate(dbhclass = paste0("class", dbhclass)) %>%
+  tidyr::spread(dbhclass, ntrees, fill = 0) %>%
+
+  arrange(species)
+
+```
+
+
+### Species for modelling
+
+Species category "u" means unknown eucalypt. There are some cases in the tree data (both dat34 and dat12) that need to be checked. For the log data we want to include the "u" cases in the modelling data set.
+
+### Update, species entries have been checked, confirm then "u" must be kept in addition to the fake species "E. unkn", which was created for unknown species of charred logs (i.e. bark type = 'burnt').
+
+```{r}
+
+excluded <- c("A.litt", "A.toru", "B.serr", "C.apet", "C.australis", "Other", "A. deal")
+
+species.summary <- species.summary %>%
+  mutate(model = !(species %in% excluded) )
+
+```
+
+
+### Prepare data for modelling
+
+We will exclude the smallest trees (DBH class 1).
+
+```{r}
+
+dat.model <- DAT.all.trees %>%
+  
+  # Subset to species to model
+  left_join(species.summary %>% select(species, model), 
+            by = "species") %>%
+  
+  filter(model) %>%
+  select(-model) 
+
+  
+```
+
+
+Add site attributes. 
+
+*Note:* this relies on the code in document `import_site_data.Rmd` being run first.
+
+```{r}
+
+load( here("data", "sites.RData") )
+
+dat.model <- dat.model %>%
+  left_join(
+    DAT.sites %>% select(siteid, vegtype,
+                         fireclass, firecount,
+                         droughtclass, droughtclass2, spei,
+                         easting, northing),
+    
+    by = "siteid"
+  )
+
+```
+
+
+## Models for DSF observations
+
+```{r}
+
+dat.model.r.DSF <- dat.model %>%
+  filter(vegtype == "dsf")
+ 
+dat.model.r.DSF.tmp <- dat.model.r.DSF %>%
+  mutate(droughtclass = factor(droughtclass, 
+                               levels = c("low",         "high"),
+                               labels = c("low drought", "high drought"))) %>%
+  mutate(fireclass = factor(fireclass, 
+                            levels = c("low",     "high"),
+                            labels = c("low fire", "high fire")))
+
+
+```
+
+
+
+
+```{r}
+dat.model.r.DSF <- dat.model.r.DSF.tmp %>%
+  select(recruit, source, siteid) %>%
+  
+  
+  group_by(siteid, source) %>%
+  
+  summarize(nseed = sum(recruit == "recruit"),
+            nsprout = sum(recruit == "resprout")) %>%
+
+  mutate(
+    nseed = case_when(source == "dat12" ~ nseed * 4,
+                      source == "dat34" ~ nseed * 1)) %>%
+  
+    mutate(
+    nsprout = case_when(source == "dat12" ~ nsprout * 4,
+                        source == "dat34" ~ nsprout * 1)) %>%
+  
+  select(-(source)) %>%
+  
+    ungroup()
+
+dat.model.r.DSF <- dat.model.r.DSF %>%
+  select(nseed, nsprout, siteid) %>%
+  
+  
+  group_by(siteid) %>%
+  summarize(total = sum(nseed, nsprout)) %>%
+  
+      ungroup()
+  
+
+dat.sitelist <- DAT.sites %>%
+  select(siteid, droughtclass, fireclass, vegtype) %>%
+  filter(vegtype == "dsf") %>%
+  select(-(vegtype))
+
+# Add predictor data
+dat.model.r.DSF <- dat.model.r.DSF %>%
+ left_join(dat.sitelist %>% distinct(siteid, fireclass, droughtclass), by = "siteid") %>%
+
+  tidyr::complete(dat.sitelist, fill = list(total = 0)) %>%
+
+  mutate(siteid = factor(siteid),
+         isiteid = as.integer(siteid)) %>%
+  
+    mutate(droughtclass = factor(droughtclass, 
+                               levels = c("low",         "high"),
+                               labels = c("low drought", "high drought"))) %>%
+  mutate(fireclass = factor(fireclass, 
+                            levels = c("low",     "high"),
+                            labels = c("low fire", "high fire"))) %>%
+  
+    mutate(droughtfire = interaction(droughtclass, fireclass)) 
+```
+
+
+
+```{r fig.height = 4, fig.width = 4}
+
+## re-arrange 'firedrought
+
+dat.model.r.DSF.plot <- dat.model.r.DSF %>%
+
+
+ ## Give better labels to droughtfire for plotting
+
+  tidyr::unite(droughtclass_fireclass, droughtclass, fireclass) %>%
+  mutate(var = factor(droughtclass_fireclass, levels = c("low drought_low fire", "low drought_high fire", "high drought_low fire", "high drought_high fire"),
+                                              labels = c("MD/LF",                "MD/HF",                 "SD/LF",                 "SD/HF")))
+
+
+```
+
+
+## model
+
+```{r}
+DAT.DSF <- dat.model.r.DSF
+
+```
+
+## DSF
+
+Lookup table for drought-fire 'treatments'
+
+```{r}
+
+TreatLookup <- data.frame(droughtfire = levels(DAT.DSF$droughtfire)) %>%
+  
+  mutate(
+    drought.label = ifelse(str_detect(droughtfire, "low.drought"), "MD", "SD"),
+    fire.label = ifelse(str_detect(droughtfire, "low.fire"), "LF", "HF"),
+    
+    treat.label = paste(drought.label, fire.label, sep = "_"),
+    
+    treat.factor = factor(treat.label, 
+                          levels = c("MD_LF", "MD_HF", "SD_LF", "SD_HF")),
+    
+    treat.index = as.integer(treat.factor)
+  ) %>%
+  
+  arrange(treat.index)
+
+```
+
+
+### Model 1 - no frills
+
+Basic JAGS model fitting negative binomial distribution to the number of seedlings in each treatment. Not bothering with a site random effect (yet).
+
+```{r}
+
+model1.code <- "model {
+  for (i in 1:length(total)) {
+    total[i] ~ dnegbin(p[treatment[i]], sz[treatment[i]])
+    
+    # monitor log-likelihood for WAIC calculation
+    loglik[i] <- logdensity.negbin(total[i], p[treatment[i]], sz[treatment[i]])
+  }
+  
+  for (i in 1:4) {
+    p[i] <- sz[i] / (sz[i] + mu[i])
+    sz[i] ~ dexp(1 / sz0)
+    mu[i] ~ dexp(1 / mu0)
+    
+    # monitor median value
+    mid[i] <- qnegbin(0.5, p[i], sz[i])
+  }
+  
+  sz0 ~ dexp(1)
+  mu0 ~ dexp(0.01)
+}"
+
+```
+
+
+Run the model and get the posterior estimates for median number of seedlings.
+
+```{r}
+
+dat.model.DSF <- DAT.DSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(total, treatment = treat.index)
+
+
+model1 <- run.jags(model1.code, 
+                   monitor = c("mu", "sz", "mid", "loglik"), 
+                   data = dat.model.DSF, 
+                   burnin = 5000,
+                   sample = 5000,
+                   thin = 5,
+                   n.chains = 4,
+                   method = "parallel",
+                   inits = function() {
+                     list(mu0 = rexp(1, 0.01), sz0 = rexp(1, 1))
+                   })
+
+```
+
+
+Look at the model summary to check convergence etc. The 'psrf' column is the Gelman Rubin statistic that we would like to be very close to 1.0.  The SSeff column is the number of effectively independent samples.
+
+```{r}
+
+summary(model1, vars = c("mu", "sz", "mid"))
+
+```
+
+Plot the model object to check trace and distributions
+
+```{r}
+
+plot(model1, plot.type = c("trace", "histogram"), vars = c("mu", "sz", "mid"))
+
+```
+
+
+Get posterior matrix and calculate the WAIC value for this model
+
+```{r}
+
+post <- as.matrix(model1$mcmc)
+ii <- stringr::str_detect(colnames(post), "loglik")
+model1.waic <- loo::waic(post[, ii])
+print(model1.waic)
+
+```
+
+
+```{r}
+
+post <- as.matrix(model1$mcmc)
+
+# We are only interested in the columns for median values
+ii <- str_detect(colnames(post), "^mid\\[")
+post <- post[, ii]
+
+# fix column names
+colnames(post) <- TreatLookup$treat.label
+head(post)
+
+```
+
+
+Graph intervals for the posterior medians. Note we are just doing quick and dirty quantile intervals here rather than HPD intervals.
+
+```{r}
+
+dat.stats <- t( apply(post, 2, quantile, 
+                      probs = c(0.025, 0.25, 0.5, 0.75, 0.975)) )
+
+dat.stats <- dat.stats %>%
+  as.data.frame() %>%
+  
+  mutate(treat.label = rownames(.)) %>%
+  
+  filter(treat.label %in% TreatLookup$treat.label) %>%
+  
+  rename(lwr95 = `2.5%`, lwr50 = `25%`, 
+         mid = `50%`,
+         upr50 = `75%`, upr95 = `97.5%`) %>%
+  
+  left_join(TreatLookup %>% select(treat.label, treat.factor),
+            by = "treat.label")
+
+
+dat.obs <- DAT.DSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(treat.factor, total)
+
+
+ggplot() +
+  geom_jitter(dat = dat.obs,
+              aes(x = treat.factor, y = total),
+              width = 0.2, height = 0, shape = 1) +
+
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr95, ymax = upr95),
+                 size = 1) +
+  
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr50, ymax = upr50),
+                 size = 3) +
+  
+  scale_y_sqrt() +
+
+  labs(x = "", y = "Post-fire abundance",
+       title = "DSF sites: Median expected number of juveniles post-fire",
+       subtitle = paste("Intervals are 50% and 95% bounds.")) +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+### Model 2 - add site random effect
+
+The basic model performs very well so it's not clear that any additional complexity is required. But out of interest, we add a site random effect term to the model and compare the model diagnostics and posterior intervals to the first model.
+
+**Note** to add a random site effect we are more or less forced to work on the log scale to avoid sampling negative mean values. This makes the model code a lot more verbose compare to the previous basic model.
+
+```{r}
+
+model2.code <- "model {
+  for (i in 1:length(total)) {
+    total[i] ~ dnegbin(p[i], sz[treatment[i]])
+    
+    p[i] <- sz[treatment[i]] / (sz[treatment[i]] + mu.site[i])
+    mu.site[i] <- exp(mulog.site[i])
+    mulog.site[i] <- mulog[treatment[i]] + zlog[i]    
+    zlog[i] ~ dnorm(0, z.sd^(-2))
+    
+    # monitor log-likelihood for WAIC calculation
+    loglik[i] <- logdensity.negbin(total[i], p[i], sz[treatment[i]])
+  }
+  
+  for (i in 1:4) {
+    sz[i] ~ dexp(1 / sz0)
+    mulog[i] ~ dnorm(mulog0, mulog.sd^(-2))
+    
+    # back-transform treatment mean to monitor
+    mu[i] <- exp(mulog[i])
+  }
+  
+  sz0 ~ dexp(1)
+  mulog0 ~ dnorm(0, 0.05)
+  mulog.sd ~ dexp(1)
+  
+  # Random effect standard deviation on log scale
+  z.sd ~ dexp(10)
+}"
+
+```
+
+
+Run the model and get the posterior estimates for median number of seedlings.
+
+```{r}
+
+model2 <- run.jags(model2.code, 
+                   monitor = c("mu", "sz", "z.sd", "loglik"), 
+                   data = dat.model.DSF, 
+                   burnin = 5000,
+                   sample = 5000,
+                   thin = 5,
+                   n.chains = 4,
+                   method = "parallel",
+                   inits = function() {
+                     list(z.sd = rexp(1, 10), 
+                          mulog0 = rnorm(1, 0, 1), 
+                          sz0 = rexp(1, 1))
+                   })
+
+```
+
+
+Look at the model summary to check convergence etc. The 'psrf' column is the Gelman Rubin statistic that we would like to be very close to 1.0.  The SSeff column is the number of effectively independent samples.
+
+```{r}
+
+summary(model2, vars = c("mu", "sz", "z.sd"))
+
+```
+
+Note the very low number of effective samples for the z.sd (random effect standard deviation) term.
+
+Plot the model object to check trace and distributions.
+
+```{r}
+
+plot(model2, plot.type = c("trace", "histogram"), vars = c("mu", "sz", "z.sd"))
+
+```
+
+The trace plot for z.sd displays a lot of meandering and very poor mixing between the chains.
+
+Let's soldier on regardless...
+
+Get posterior matrix and calculate the WAIC value for this model
+
+```{r}
+
+post2 <- as.matrix(model2$mcmc)
+ii <- stringr::str_detect(colnames(post2), "loglik")
+
+model2.waic <- loo::waic(post2[, ii])
+print(model2.waic)
+
+```
+
+The WAIC value is almost identical (very slightly larger) than that for model1. On this basis we would prefer the simpler model, model1, over the site random effect model, model2.
+
+Calculate the posterior median value for each model iteration. With model1 we calculated medians as part of the jags code, but with model2 this was not so easy, so instead we use the base R `qnbinom` function to calculate medians from the mean and size parameter values for each iteration.
+
+```{r}
+
+mu.cols <- which(str_detect(colnames(post2), "^mu"))
+sz.cols <- which(str_detect(colnames(post2), "^sz"))
+
+post2.medians <- qnbinom(0.5, 
+                         mu = post2[, mu.cols], 
+                         size = post2[, sz.cols])
+
+
+# fix column names
+colnames(post2.medians) <- TreatLookup$treat.label
+head(post2.medians)
+
+```
+
+
+Graph intervals for the posterior medians. Note we are just doing quick and dirty quantile intervals here rather than HPD intervals.
+
+```{r}
+
+dat.stats <- t( apply(post2.medians, 2, quantile, 
+                      probs = c(0.025, 0.25, 0.5, 0.75, 0.975)) )
+
+dat.stats <- dat.stats %>%
+  as.data.frame() %>%
+  
+  mutate(treat.label = rownames(.)) %>%
+  
+  filter(treat.label %in% TreatLookup$treat.label) %>%
+  
+  rename(lwr95 = `2.5%`, lwr50 = `25%`, 
+         mid = `50%`,
+         upr50 = `75%`, upr95 = `97.5%`) %>%
+  
+  left_join(TreatLookup %>% select(treat.label, treat.factor),
+            by = "treat.label")
+
+
+dat.obs <- DAT.DSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(treat.factor, total)
+
+
+ggplot() +
+  geom_jitter(dat = dat.obs,
+              aes(x = treat.factor, y = total),
+              width = 0.2, height = 0, shape = 1) +
+
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr95, ymax = upr95),
+                 size = 1) +
+  
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr50, ymax = upr50),
+                 size = 3) +
+  
+  scale_y_sqrt() +
+
+  labs(x = "", y = "Post-fire abundance",
+       title = "DSF sites: Median expected post-fire abundance",
+       subtitle = paste("Intervals are 50% and 95% bounds.")) +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+The intervals are very close to those derived from model 1.
+
+Conclusion: use model1. 
+
+The random effect term does not improve the model fit (as assessed by WAIC) and JAGS has a lot of trouble sampling it effectively. This has probably also been the case for brms/Stan. The negative binomial distribution already has enough flexibility to represent the data, and the hierarchical form of the model, with top level priors for mean (mu0) and size (sz0) parameters serves to reduce the effect of outliers in the MD/LF and SD/HF classes.
+
+
+```{r}
+
+
+effect1 <- as.data.frame(post2.medians) %>%
+    mutate(mild_low = MD_LF,
+         mild_high = MD_HF,
+         severe_low = SD_LF,
+         severe_high = SD_HF)
+
+
+```
+
+```{r}
+
+head(effect1)
+
+```
+
+
+```{r}
+
+## calculate probability estimates
+
+diff1 <- effect1 %>%
+  mutate(diff1_MD_LF = MD_LF,
+         diff1_MD_HF = MD_HF,
+         diff1_SD_LF = SD_LF,
+         diff1_SD_HF = SD_HF) %>%
+  
+  select(starts_with("diff1"))
+
+head(diff1)
+
+
+## Calculate predicted difference
+
+## diff drought
+
+diff2 <- effect1 %>%
+  
+  mutate(diff2_low = severe_low - mild_low,
+         diff2_high = severe_high - mild_high) %>%
+  
+  select(starts_with("diff2"))
+
+diff3 <- effect1 %>%
+  
+  mutate(diff3_low = (severe_low - mild_low) / mild_low * 100,
+         diff3_high = (severe_high - mild_high) / mild_high * 100) %>%
+  
+  select(starts_with("diff3"))
+
+## diff fire
+
+
+diff2.a <- effect1 %>%
+  
+  mutate(diff2a_mild = mild_high - mild_low,
+         diff2a_severe = severe_high - severe_low) %>%
+  
+  select(starts_with("diff2a"))
+
+diff3.a <- effect1 %>%
+  
+  mutate(diff3a_mild = (mild_high - mild_low) / mild_low * 100,
+         diff3a_severe = (severe_high - severe_low) / severe_low * 100) %>%
+  
+  select(starts_with("diff3a"))
+
+## diff severe conditions
+
+diff3.s <- effect1 %>%
+  
+  mutate(diff3s_mild = (severe_high - mild_low) / mild_low * 100) %>%
+  
+  select(starts_with("diff3s"))
+
+```
+
+
+
+
+
+```{r}
+# convert to long format for ggplot
+dat.gg1 <- diff1 %>%
+  tidyr::gather(var, diff1) %>%
+  mutate(var = factor(str_replace(var, "diff1_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+  mutate(var = factor(var, levels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF"), 
+                           labels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF")))
+
+
+x.stats1 <- dat.gg1 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff1),
+            lwr95 = hpdi.vec(diff1, 0.95)[1],
+            upr95 = hpdi.vec(diff1, 0.95)[2],
+            lwr50 = hpdi.vec(diff1, 0.50)[1],
+            upr50 = hpdi.vec(diff1, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg2 <- diff2 %>%
+  tidyr::gather(var, diff2) %>%
+  mutate(var = factor(str_replace(var, "diff2_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats2 <- dat.gg2 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff2),
+            lwr95 = hpdi.vec(diff2, 0.95)[1],
+            upr95 = hpdi.vec(diff2, 0.95)[2],
+            lwr50 = hpdi.vec(diff2, 0.50)[1],
+            upr50 = hpdi.vec(diff2, 0.50)[2]) %>%
+      mutate(var = factor(var, levels = c("low", "high"), 
+                             labels = c("low", "high")))
+
+# convert to long format for ggplot
+dat.gg3 <- diff3 %>%
+  tidyr::gather(var, diff3) %>%
+  mutate(var = factor(str_replace(var, "diff3_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats3<- dat.gg3 %>%
+  group_by(var) %>%
+    summarize(mid = median(diff3),
+            lwr95 = hpdi.vec(diff3, 0.95)[1],
+            upr95 = hpdi.vec(diff3, 0.95)[2],
+            lwr50 = hpdi.vec(diff3, 0.50)[1],
+            upr50 = hpdi.vec(diff3, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg2.a <- diff2.a %>%
+  tidyr::gather(var, diff2a) %>%
+  mutate(var = factor(str_replace(var, "diff2a_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats2.a <- dat.gg2.a %>%
+  group_by(var) %>%
+    summarize(mid = median(diff2a),
+            lwr95 = hpdi.vec(diff2a, 0.95)[1],
+            upr95 = hpdi.vec(diff2a, 0.95)[2],
+            lwr50 = hpdi.vec(diff2a, 0.50)[1],
+            upr50 = hpdi.vec(diff2a, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg3.a <- diff3.a %>%
+  tidyr::gather(var, diff3a) %>%
+  mutate(var = factor(str_replace(var, "diff3a_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats3.a <- dat.gg3.a %>%
+  group_by(var) %>%
+    summarize(mid = median(diff3a),
+            lwr95 = hpdi.vec(diff3a, 0.95)[1],
+            upr95 = hpdi.vec(diff3a, 0.95)[2],
+            lwr50 = hpdi.vec(diff3a, 0.50)[1],
+            upr50 = hpdi.vec(diff3a, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg3.s <- diff3.s %>%
+  tidyr::gather(var, diff3s) %>%
+  mutate(var = factor(str_replace(var, "diff3s_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats3.s <- dat.gg3.s %>%
+  group_by(var) %>%
+    summarize(mid = median(diff3s),
+            lwr95 = hpdi.vec(diff3s, 0.95)[1],
+            upr95 = hpdi.vec(diff3s, 0.95)[2],
+            lwr50 = hpdi.vec(diff3s, 0.50)[1],
+            upr50 = hpdi.vec(diff3s, 0.50)[2])
+
+
+```
+
+
+```{r fig.height = 3, fig.width = 3}
+
+rhg_cols2 <- c("MD/LF" = "#1b9e77", "MD/HF" = "#d95f02", "SD/LF" = "#7570b3", "SD/HF" = "#e7298a")
+
+
+My_Theme = theme(
+  plot.title = element_text(size = 11.5, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11.5, face = "bold"),
+  axis.text.y = element_text(size = 9.5, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10.5, vjust = 0.9, hjust = 0.9, margin = unit(c(0.15, 0.1, 0.1, 0.1), "cm"), angle = 45),
+  axis.title.x = element_text(size = 11.5, face = "bold", vjust = -1.8),
+  strip.text.x = element_text(size = 10.5),
+  strip.text.y = element_text(size = 10.5),
+  strip.text = element_text(size = 10.5),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  strip.placement = "inside",
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  legend.position = "bottom",
+  legend.title = element_text(size = 8.5, hjust = 0.6, face = "bold"),
+  legend.text = element_text(size = 7.5),
+  legend.key.width = unit(0.5, "cm"),
+  legend.background = element_blank(),
+  plot.margin = unit(c(5.5, 4, 6.5, 4), "pt"))
+
+
+DSF.mature.abund <- ggplot(data = dat.gg1, aes (x = var)) +
+  
+ My_Theme +
+  
+    geom_jitter(data = dat.model.r.DSF.plot, aes(y = total, col = var), 
+            height = 0.2,
+            size = 0.8, alpha = 0.3, width = 0.25, show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats1, aes(ymin = lwr95, ymax = upr95),
+               size = 0.5) +
+ 
+  geom_linerange(data = x.stats1, aes(ymin = lwr50, ymax = upr50),
+               size = 5., show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats1, aes(ymin = lwr50+2, ymax = upr50-2, color = var),
+               size = 4, show.legend = FALSE) +
+ 
+ scale_color_manual(values = rhg_cols2) +
+ 
+
+  labs(y = "", x = "", title = "DSF") +
+  
+  
+    scale_y_continuous(breaks = c(50, 75, 100, 125, 150, 175, 200, 225, 250)) +
+  coord_cartesian(ylim=c(50,250)) 
+
+   
+   ggsave("DSF.mature.abund.png")
+
+DSF.mature.abund
+ 
+```
+
+```{r}
+### how many points are above the plot window?
+points <- dat.model.r.DSF.plot %>%
+  filter(total >= 250) %>%
+  group_by(var) %>%
+  count(var)
+
+knitr::kable(points, digits = 3)
+```
+
+Probability of an increase in topkill cats relative to the reference level:
+
+```{r}
+
+means <- dat.gg1 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff1))
+
+knitr::kable(means, digits = 3)
+
+```
+
+```{r}
+knitr::kable(x.stats1, digits = 3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# diff drought num
+
+dat.gg2 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff2))
+
+```
+
+
+```{r}
+
+# diff drought num
+
+dat.gg2 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff2))
+
+```
+
+
+
+diff drought %
+
+```{r}
+
+dat.gg3 %>%
+  group_by(var) %>%
+  summarize(prob = median(diff3))
+
+```
+
+diff fire num
+
+```{r}
+
+dat.gg2.a %>%
+  group_by(var) %>%
+  summarize(prob = median(diff2a))
+
+```
+diff fire %
+
+```{r}
+
+dat.gg3.a %>%
+  group_by(var) %>%
+  summarize(prob = median(diff3a))
+
+```
+
+diff severe cond
+
+```{r}
+
+dat.gg3.s %>%
+  group_by(var) %>%
+  summarize(prob = median(diff3s))
+
+```
+
+## Models for WSF observations
+
+```{r}
+
+dat.model.r.WSF <- dat.model %>%
+  filter(vegtype == "wsf")
+ 
+dat.model.r.WSF.tmp <- dat.model.r.WSF %>%
+  mutate(droughtclass = factor(droughtclass, 
+                               levels = c("low",         "high"),
+                               labels = c("low drought", "high drought"))) %>%
+  mutate(fireclass = factor(fireclass, 
+                            levels = c("low",     "high"),
+                            labels = c("low fire", "high fire")))
+
+
+```
+
+
+
+
+
+```{r}
+dat.model.r.WSF <- dat.model.r.WSF.tmp %>%
+  select(recruit, source, siteid) %>%
+   
+  
+  group_by(siteid, source) %>%
+  
+  summarize(nseed = sum(recruit == "recruit"),
+            nsprout = sum(recruit == "resprout")) %>%
+
+  mutate(
+    nseed = case_when(source == "dat12" ~ nseed * 4,
+                      source == "dat34" ~ nseed * 1)) %>%
+  
+    mutate(
+    nsprout = case_when(source == "dat12" ~ nsprout * 4,
+                        source == "dat34" ~ nsprout * 1)) %>%
+  
+  select(-(source)) %>%
+  
+    ungroup()
+
+dat.model.r.WSF <- dat.model.r.WSF %>%
+  select(nseed, nsprout, siteid) %>%
+  
+  
+  group_by(siteid) %>%
+  summarize(total = sum(nseed, nsprout)) %>%
+  
+      ungroup()
+  
+
+  
+
+dat.sitelist <- DAT.sites %>%
+  select(siteid, droughtclass, fireclass, vegtype) %>%
+  filter(vegtype == "wsf") %>%
+  select(-(vegtype))
+
+# Add predictor data
+dat.model.r.WSF <- dat.model.r.WSF %>%
+ left_join(dat.sitelist %>% distinct(siteid, fireclass, droughtclass), by = "siteid") %>%
+
+  tidyr::complete(dat.sitelist, fill = list(total = 0)) %>%
+
+  mutate(siteid = factor(siteid),
+         isiteid = as.integer(siteid)) %>%
+  
+    mutate(droughtclass = factor(droughtclass, 
+                               levels = c("low",         "high"),
+                               labels = c("low drought", "high drought"))) %>%
+  mutate(fireclass = factor(fireclass, 
+                            levels = c("low",     "high"),
+                            labels = c("low fire", "high fire"))) %>%
+  
+    mutate(droughtfire = interaction(droughtclass, fireclass)) 
+```
+
+
+
+## nseedlings calculations
+
+```{r fig.height = 4, fig.width = 4}
+
+## re-arrange 'firedrought
+
+dat.model.r.WSF.plot <- dat.model.r.WSF %>%
+
+ ## Give better labels to droughtfire for plotting
+
+  tidyr::unite(droughtclass_fireclass, droughtclass, fireclass) %>%
+  mutate(var = factor(droughtclass_fireclass, levels = c("low drought_low fire", "low drought_high fire", "high drought_low fire", "high drought_high fire"),
+                                              labels = c("MD/LF",                "MD/HF",                 "SD/LF",                 "SD/HF")))
+
+
+```
+
+## Data
+
+```{r}
+
+DAT.WSF <- dat.model.r.WSF
+
+```
+
+## DSF
+
+Lookup table for drought-fire 'treatments'
+
+```{r}
+
+TreatLookup <- data.frame(droughtfire = levels(DAT.WSF$droughtfire)) %>%
+  
+  mutate(
+    drought.label = ifelse(str_detect(droughtfire, "low.drought"), "MD", "SD"),
+    fire.label = ifelse(str_detect(droughtfire, "low.fire"), "LF", "HF"),
+    
+    treat.label = paste(drought.label, fire.label, sep = "_"),
+    
+    treat.factor = factor(treat.label, 
+                          levels = c("MD_LF", "MD_HF", "SD_LF", "SD_HF")),
+    
+    treat.index = as.integer(treat.factor)
+  ) %>%
+  
+  arrange(treat.index)
+
+```
+
+
+### Model 1 - no frills
+
+Basic JAGS model fitting negative binomial distribution to the number of seedlings in each treatment. Not bothering with a site random effect (yet).
+
+```{r}
+
+model1.code.WSF <- "model {
+  for (i in 1:length(total)) {
+    total[i] ~ dnegbin(p[treatment[i]], sz[treatment[i]])
+    
+    # monitor log-likelihood for WAIC calculation
+    loglik[i] <- logdensity.negbin(total[i], p[treatment[i]], sz[treatment[i]])
+  }
+  
+  for (i in 1:4) {
+    p[i] <- sz[i] / (sz[i] + mu[i])
+    sz[i] ~ dexp(1 / sz0)
+    mu[i] ~ dexp(1 / mu0)
+    
+    # monitor median value
+    mid[i] <- qnegbin(0.5, p[i], sz[i])
+  }
+  
+  sz0 ~ dexp(1)
+  mu0 ~ dexp(0.01)
+}"
+
+```
+
+
+Run the model and get the posterior estimates for median number of seedlings.
+
+```{r}
+
+dat.model.WSF <- DAT.WSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(total, treatment = treat.index)
+
+
+model1.WSF <- run.jags(model1.code.WSF, 
+                   monitor = c("mu", "sz", "mid", "loglik"), 
+                   data = dat.model.WSF, 
+                   burnin = 5000,
+                   sample = 5000,
+                   thin = 5,
+                   n.chains = 4,
+                   method = "parallel",
+                   inits = function() {
+                     list(mu0 = rexp(1, 0.01), sz0 = rexp(1, 1))
+                   })
+
+```
+
+
+Look at the model summary to check convergence etc. The 'psrf' column is the Gelman Rubin statistic that we would like to be very close to 1.0.  The SSeff column is the number of effectively independent samples.
+
+```{r}
+
+summary(model1.WSF, vars = c("mu", "sz", "mid"))
+
+```
+
+Plot the model object to check trace and distributions
+
+```{r}
+
+plot(model1.WSF, plot.type = c("trace", "histogram"), vars = c("mu", "sz", "mid"))
+
+```
+
+
+Get posterior matrix and calculate the WAIC value for this model
+
+```{r}
+
+post.WSF <- as.matrix(model1.WSF$mcmc)
+ii <- stringr::str_detect(colnames(post.WSF), "loglik")
+model1.waic.WSF <- loo::waic(post.WSF[, ii])
+print(model1.waic.WSF)
+
+```
+
+
+```{r}
+
+post.WSF <- as.matrix(model1.WSF$mcmc)
+
+# We are only interested in the columns for median values
+ii <- str_detect(colnames(post.WSF), "^mid\\[")
+post.WSF <- post.WSF[, ii]
+
+# fix column names
+colnames(post.WSF) <- TreatLookup$treat.label
+head(post.WSF)
+
+```
+
+
+Graph intervals for the posterior medians. Note we are just doing quick and dirty quantile intervals here rather than HPD intervals.
+
+```{r}
+
+dat.stats <- t( apply(post.WSF, 2, quantile, 
+                      probs = c(0.025, 0.25, 0.5, 0.75, 0.975)) )
+
+dat.stats <- dat.stats %>%
+  as.data.frame() %>%
+  
+  mutate(treat.label = rownames(.)) %>%
+  
+  filter(treat.label %in% TreatLookup$treat.label) %>%
+  
+  rename(lwr95 = `2.5%`, lwr50 = `25%`, 
+         mid = `50%`,
+         upr50 = `75%`, upr95 = `97.5%`) %>%
+  
+  left_join(TreatLookup %>% select(treat.label, treat.factor),
+            by = "treat.label")
+
+
+dat.obs <- DAT.WSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(treat.factor, total)
+
+
+ggplot() +
+  geom_jitter(dat = dat.obs,
+              aes(x = treat.factor, y = total),
+              width = 0.2, height = 0, shape = 1) +
+
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr95, ymax = upr95),
+                 size = 1) +
+  
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr50, ymax = upr50),
+                 size = 3) +
+  
+  scale_y_sqrt() +
+
+  labs(x = "", y = "Post-fire abundance",
+       title = "WSF sites: Median expected post-fire abundance",
+       subtitle = paste("Intervals are 50% and 95% bounds.")) +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+### Model 2 - add site random effect
+
+The basic model performs very well so it's not clear that any additional complexity is required. But out of interest, we add a site random effect term to the model and compare the model diagnostics and posterior intervals to the first model.
+
+**Note** to add a random site effect we are more or less forced to work on the log scale to avoid sampling negative mean values. This makes the model code a lot more verbose compare to the previous basic model.
+
+```{r}
+
+model2.code.WSF <- "model {
+  for (i in 1:length(total)) {
+    total[i] ~ dnegbin(p[i], sz[treatment[i]])
+    
+    p[i] <- sz[treatment[i]] / (sz[treatment[i]] + mu.site[i])
+    mu.site[i] <- exp(mulog.site[i])
+    mulog.site[i] <- mulog[treatment[i]] + zlog[i]    
+    zlog[i] ~ dnorm(0, z.sd^(-2))
+    
+    # monitor log-likelihood for WAIC calculation
+    loglik[i] <- logdensity.negbin(total[i], p[i], sz[treatment[i]])
+  }
+  
+  for (i in 1:4) {
+    sz[i] ~ dexp(1 / sz0)
+    mulog[i] ~ dnorm(mulog0, mulog.sd^(-2))
+    
+    # back-transform treatment mean to monitor
+    mu[i] <- exp(mulog[i])
+  }
+  
+  sz0 ~ dexp(1)
+  mulog0 ~ dnorm(0, 0.05)
+  mulog.sd ~ dexp(1)
+  
+  # Random effect standard deviation on log scale
+  z.sd ~ dexp(10)
+}"
+
+```
+
+
+Run the model and get the posterior estimates for median number of seedlings.
+
+```{r}
+
+model2.WSF <- run.jags(model2.code.WSF, 
+                   monitor = c("mu", "sz", "z.sd", "loglik"), 
+                   data = dat.model.WSF, 
+                   burnin = 5000,
+                   sample = 5000,
+                   thin = 5,
+                   n.chains = 4,
+                   method = "parallel",
+                   inits = function() {
+                     list(z.sd = rexp(1, 10), 
+                          mulog0 = rnorm(1, 0, 1), 
+                          sz0 = rexp(1, 1))
+                   })
+
+```
+
+
+Look at the model summary to check convergence etc. The 'psrf' column is the Gelman Rubin statistic that we would like to be very close to 1.0.  The SSeff column is the number of effectively independent samples.
+
+```{r}
+
+summary(model2.WSF, vars = c("mu", "sz", "z.sd"))
+
+```
+
+Note the very low number of effective samples for the z.sd (random effect standard deviation) term.
+
+Plot the model object to check trace and distributions.
+
+```{r}
+
+plot(model2.WSF, plot.type = c("trace", "histogram"), vars = c("mu", "sz", "z.sd"))
+
+```
+
+The trace plot for z.sd displays a lot of meandering and very poor mixing between the chains.
+
+Let's soldier on regardless...
+
+Get posterior matrix and calculate the WAIC value for this model
+
+```{r}
+
+post2.WSF <- as.matrix(model2.WSF$mcmc)
+ii <- stringr::str_detect(colnames(post2.WSF), "loglik")
+
+model2.waic.WSF <- loo::waic(post2.WSF[, ii])
+print(model2.waic.WSF)
+
+```
+
+The WAIC value is almost identical (very slightly larger) than that for model1. On this basis we would prefer the simpler model, model1, over the site random effect model, model2.
+
+Calculate the posterior median value for each model iteration. With model1 we calculated medians as part of the jags code, but with model2 this was not so easy, so instead we use the base R `qnbinom` function to calculate medians from the mean and size parameter values for each iteration.
+
+```{r}
+
+mu.cols <- which(str_detect(colnames(post2.WSF), "^mu"))
+sz.cols <- which(str_detect(colnames(post2.WSF), "^sz"))
+
+post2.medians.WSF <- qnbinom(0.5, 
+                         mu = post2.WSF[, mu.cols], 
+                         size = post2.WSF[, sz.cols])
+
+
+# fix column names
+colnames(post2.medians.WSF) <- TreatLookup$treat.label
+head(post2.medians.WSF)
+
+```
+
+
+Graph intervals for the posterior medians. Note we are just doing quick and dirty quantile intervals here rather than HPD intervals.
+
+```{r}
+
+dat.stats <- t( apply(post2.medians.WSF, 2, quantile, 
+                      probs = c(0.025, 0.25, 0.5, 0.75, 0.975)) )
+
+dat.stats <- dat.stats %>%
+  as.data.frame() %>%
+  
+  mutate(treat.label = rownames(.)) %>%
+  
+  filter(treat.label %in% TreatLookup$treat.label) %>%
+  
+  rename(lwr95 = `2.5%`, lwr50 = `25%`, 
+         mid = `50%`,
+         upr50 = `75%`, upr95 = `97.5%`) %>%
+  
+  left_join(TreatLookup %>% select(treat.label, treat.factor),
+            by = "treat.label")
+
+
+dat.obs <- DAT.WSF %>%
+  left_join(TreatLookup, by = "droughtfire") %>%
+  select(treat.factor, total)
+
+
+ggplot() +
+  geom_jitter(dat = dat.obs,
+              aes(x = treat.factor, y = total),
+              width = 0.2, height = 0, shape = 1) +
+
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr95, ymax = upr95),
+                 size = 1) +
+  
+  geom_linerange(data = dat.stats, 
+                 aes(x = treat.factor, ymin = lwr50, ymax = upr50),
+                 size = 3) +
+  
+  scale_y_sqrt() +
+
+  labs(x = "", y = "Post-fire abundance",
+       title = "WSF sites: Median expected post-fire abundance",
+       subtitle = paste("Intervals are 50% and 95% bounds.")) +
+  
+  theme(panel.grid.minor = element_blank())
+
+
+```
+
+
+
+```{r}
+
+
+effect2 <- as.data.frame(post.WSF) %>%
+    mutate(mild_low = MD_LF,
+         mild_high = MD_HF,
+         severe_low = SD_LF,
+         severe_high = SD_HF)
+
+
+```
+
+
+```{r}
+
+## calculate probability estimates
+
+diff1.b <- effect2 %>%
+  mutate(diff1.b_MD_LF = mild_low,
+         diff1.b_MD_HF = mild_high,
+         diff1.b_SD_LF = severe_low,
+         diff1.b_SD_HF = severe_high) %>%
+  
+  select(starts_with("diff1.b"))
+
+
+## Calculate predicted difference
+
+## diff drought
+
+diff2.b <- effect2 %>%
+  
+  mutate(diff2.b_low = severe_low - mild_low,
+         diff2.b_high = severe_high - mild_high) %>%
+  
+  select(starts_with("diff2.b"))
+
+
+diff3.b <- effect2 %>%
+  
+  mutate(diff3.b_low = (severe_low - mild_low) / mild_low * 100,
+         diff3.b_high = (severe_high - mild_high) / mild_high * 100) %>%
+  
+  select(starts_with("diff3.b"))
+
+## diff fire
+
+diff2.c <- effect2 %>%
+  
+  mutate(diff2c_mild = mild_high - mild_low,
+         diff2c_severe = severe_high - severe_low) %>%
+  
+  select(starts_with("diff2c"))
+
+diff3.c <- effect2 %>%
+  
+  mutate(diff3c_mild = (mild_high - mild_low) / mild_low * 100,
+         diff3c_severe = (severe_high - severe_low) / severe_low * 100) %>%
+  
+  select(starts_with("diff3c"))
+
+
+
+
+```
+
+
+
+
+
+```{r}
+# convert to long format for ggplot
+dat.gg1.b <- diff1.b %>%
+  tidyr::gather(var, diff1.b) %>%
+  mutate(var = factor(str_replace(var, "diff1.b_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/"))) %>%
+  mutate(var = factor(var, levels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF"), 
+                           labels = c("MD/LF", "MD/HF", "SD/LF", "SD/HF")))
+
+
+x.stats1.b <- dat.gg1.b %>%
+  group_by(var) %>%
+    summarize(mid = median(diff1.b),
+            lwr95 = hpdi.vec(diff1.b, 0.95)[1],
+            upr95 = hpdi.vec(diff1.b, 0.95)[2],
+            lwr50 = hpdi.vec(diff1.b, 0.50)[1],
+            upr50 = hpdi.vec(diff1.b, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg2.b <- diff2.b %>%
+  tidyr::gather(var, diff2.b) %>%
+  mutate(var = factor(str_replace(var, "diff2.b_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats2.b <- dat.gg2.b %>%
+  group_by(var) %>%
+    summarize(mid = median(diff2.b),
+            lwr95 = hpdi.vec(diff2.b, 0.95)[1],
+            upr95 = hpdi.vec(diff2.b, 0.95)[2],
+            lwr50 = hpdi.vec(diff2.b, 0.50)[1],
+            upr50 = hpdi.vec(diff2.b, 0.50)[2]) %>%
+    mutate(var = factor(var, levels = c("low", "high"), 
+                             labels = c("low", "high")))
+
+# convert to long format for ggplot
+dat.gg3.b <- diff3.b %>%
+  tidyr::gather(var, diff3.b) %>%
+  mutate(var = factor(str_replace(var, "diff3.b_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats3.b <- dat.gg3.b %>%
+  group_by(var) %>%
+    summarize(mid = median(diff3.b),
+            lwr95 = hpdi.vec(diff3.b, 0.95)[1],
+            upr95 = hpdi.vec(diff3.b, 0.95)[2],
+            lwr50 = hpdi.vec(diff3.b, 0.50)[1],
+            upr50 = hpdi.vec(diff3.b, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg2.c <- diff2.c %>%
+  tidyr::gather(var, diff2c) %>%
+  mutate(var = factor(str_replace(var, "diff2c_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats2.c <- dat.gg2.c %>%
+  group_by(var) %>%
+    summarize(mid = median(diff2c),
+            lwr95 = hpdi.vec(diff2c, 0.95)[1],
+            upr95 = hpdi.vec(diff2c, 0.95)[2],
+            lwr50 = hpdi.vec(diff2c, 0.50)[1],
+            upr50 = hpdi.vec(diff2c, 0.50)[2])
+
+# convert to long format for ggplot
+dat.gg3.c <- diff3.c %>%
+  tidyr::gather(var, diff3c) %>%
+  mutate(var = factor(str_replace(var, "diff3c_", ""))) %>%
+  mutate(var = factor(str_replace(var, "_", "/")))
+
+
+  
+x.stats3.c <- dat.gg3.c %>%
+  group_by(var) %>%
+    summarize(mid = median(diff3c),
+            lwr95 = hpdi.vec(diff3c, 0.95)[1],
+            upr95 = hpdi.vec(diff3c, 0.95)[2],
+            lwr50 = hpdi.vec(diff3c, 0.50)[1],
+            upr50 = hpdi.vec(diff3c, 0.50)[2])
+
+
+
+```
+
+
+```{r fig.height = 3, fig.width = 3}
+
+
+rhg_cols2 <- c("MD/LF" = "#1b9e77", "MD/HF" = "#d95f02", "SD/LF" = "#7570b3", "SD/HF" = "#e7298a")
+
+
+My_Theme = theme(
+  plot.title = element_text(size = 11.5, face = "bold", hjust = 0.5),
+  axis.title.y = element_text(size = 11.5, face = "bold"),
+  axis.text.y = element_text(size = 9.5, margin = unit(c(0.1, 0.1, 0.1, -0.2), "cm")),
+  axis.text.x = element_text(size = 10.5, vjust = 0.9, hjust = 0.9, margin = unit(c(0.15, 0.1, 0.1, 0.1), "cm"), angle = 45),
+  axis.title.x = element_text(size = 11.5, face = "bold", vjust = -1.8),
+  strip.text.x = element_text(size = 10.5),
+  strip.text.y = element_text(size = 10.5),
+  strip.text = element_text(size = 10.5),
+  strip.background = element_blank(),
+  panel.background = element_blank(),
+  strip.placement = "inside",
+  axis.ticks.length = unit(-0.07, "cm"),
+  axis.ticks = element_line(size = 0.8),
+  panel.grid.minor.x = element_blank(),
+  panel.grid.major.x = element_blank(),
+  panel.grid.minor.y = element_blank(),
+  panel.grid.major.y = element_blank(),
+  legend.position = "bottom",
+  legend.title = element_text(size = 8.5, hjust = 0.6, face = "bold"),
+  legend.text = element_text(size = 7.5),
+  legend.key.width = unit(0.5, "cm"),
+  legend.background = element_blank(),
+  plot.margin = unit(c(5.5, 4, 6.5, 4), "pt"))
+
+
+WSF.mature.abund <- ggplot(data = dat.gg1.b, aes (x = var)) +
+  
+ My_Theme +
+  
+    geom_jitter(data = dat.model.r.WSF.plot, aes(y = total, col = var), 
+            height = 0.2,
+            size = 0.8, alpha = 0.3, width = 0.25, show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats1.b, aes(ymin = lwr95, ymax = upr95),
+               size = 0.5) +
+ 
+  geom_linerange(data = x.stats1.b, aes(ymin = lwr50, ymax = upr50),
+               size = 5, show.legend = FALSE) +
+  
+  geom_linerange(data = x.stats1.b, aes(ymin = lwr50+0.7, ymax = upr50-0.7, color = var),
+               size = 4, show.legend = FALSE) +
+ 
+ scale_color_manual(values = rhg_cols2) +
+ 
+  labs(y = "", x = "", title = "WSF") +
+  
+    scale_y_continuous(breaks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90)) +
+  coord_cartesian(ylim=c(0, 90)) 
+
+   ggsave("WSF.mature.abund.png")
+
+WSF.mature.abund
+ 
+```
+
+```{r}
+### how many points are above the plot window?
+points <- dat.model.r.WSF.plot %>%
+  filter(total >= 90) %>%
+  group_by(var) %>%
+  count(var)
+
+knitr::kable(points, digits = 3)
+```
+
+
+
+```{r}
+
+means <- dat.gg1.b %>%
+  group_by(var) %>%
+  summarize(prob = median(diff1.b))
+
+knitr::kable(means, digits = 3)
+
+```
+
+```{r}
+knitr::kable(x.stats1.b, digits = 3)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+diff drought num
+
+```{r}
+
+dat.gg2.b %>%
+  group_by(var) %>%
+  summarize(prob = median(diff2.b))
+
+```
+
+diff drought %
+
+```{r}
+
+dat.gg3.b %>%
+  group_by(var) %>%
+  summarize(prob = median(diff3.b))
+
+```
+
+diff fire num
+
+```{r}
+
+dat.gg2.c %>%
+  group_by(var) %>%
+  summarize(prob = median(diff2c))
+
+```
+
+diff fire %
+
+```{r}
+
+dat.gg3.c %>%
+  group_by(var) %>%
+  summarize(prob = median(diff3c))
+
+```
