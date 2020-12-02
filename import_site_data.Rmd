@@ -1,0 +1,200 @@
+---
+title: "Import site data"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(stringr)
+
+# For spatial stuff
+library(ggmap)
+library(sf)
+
+# Default graph theme - white background
+theme_set( theme_bw() )
+
+```
+
+
+All data are in the Excel workbook `Eli_field_data14thSEP.xlsx`.
+
+```{r}
+
+ExcelPath <- here("data_raw", "Eli_field_data30thMAY.xlsx")
+
+```
+
+
+## Sites
+
+Read data from worksheet `site_info`
+
+```{r}
+
+DAT.sites <- read_excel(ExcelPath, sheet = "site_info", guess_max = 113) %>%
+  
+  select(siteid = site_id,
+         vegtype = f_type,
+         fireclass = ffreq,
+         firecount = fire_num,
+         droughtclass = dsev,
+         spei = SPEI,
+         easting,
+         northing,
+         comb,
+         slope,
+         aspect,
+         elevation = elev,
+         rock,
+         description = desc) %>%
+  
+  # Get rid of blank records (no site id)
+  filter(!is.na(siteid)) %>%
+  
+  # Factor variables for fire, drought and veg
+  mutate(fireclass = factor(fireclass, levels = 1:2, labels = c("low", "high")),
+         droughtclass = factor(droughtclass, levels = 1:2, labels = c("low", "high")),
+         vegtype = factor(vegtype)) %>%
+  
+  # First two characters of site ID can be used to put sites into spatial clusters
+  # (might be useful for modelling)
+  mutate(sitegroup = factor(str_sub(siteid, 1, 2)))
+
+```
+
+
+### Data checks and summaries
+
+Fire count against fire class.
+
+```{r}
+
+with(DAT.sites, table(firecount, fireclass))
+
+```
+
+**TODO** One 'high' fire frequency site has only two fires.
+
+```{r}
+
+#DAT.sites %>% 
+ # filter(fireclass == "high", firecount == 2) %>%
+  #select(siteid)
+
+```
+
+
+SPEI values against drought class.
+
+```{r}
+
+dat <- filter(DAT.sites, !is.na(spei))
+
+ggplot(data = dat) +
+  geom_jitter(aes(x = droughtclass, y = spei),
+              width = 0.2, height = 0.05)
+
+```
+
+**TODO** The 'low' drought sites have two equal-sized clusters of SPEI values, while the 'high' drought sites have a single cluster with a narrow range of values. It might be useful to define a second drought class variable to use for checking model residuals.
+
+```{r}
+
+DAT.sites <- DAT.sites %>%
+  
+  mutate(droughtclass2 = factor(
+    ifelse(spei < -1.5, "high", ifelse(spei < -1.0, "med", "low")),
+    levels = c("low", "med", "high")) ) %>%
+  
+  select(siteid, sitegroup, vegtype, 
+         fireclass, firecount, 
+         droughtclass, droughtclass2, 
+         everything())
+
+```
+
+
+Site coordinates are zone 56 MGA. Check for any missing coordinates.
+
+```{r}
+
+x <- DAT.sites %>%
+  filter(is.na(easting) | is.na(northing)) %>%
+  select(siteid)
+
+if (nrow(x) == 0) {
+  cat("No missing coordinates")
+} else {
+  cat("Sites with missing coordinates:\n", x$siteid)
+}
+
+```
+
+Graph coodinates against index to check for odd patterns or any values outside the expected range.
+
+```{r}
+
+plot(DAT.sites$easting)
+
+```
+
+```{r}
+
+plot(DAT.sites$northing)
+
+```
+
+Plot site locations against a base map as a visual check.
+
+```{r fig.width=8, fig.height=8}
+
+dat.mga <- DAT.sites %>%
+  st_as_sf(coords = c("easting", "northing"))
+
+# Set coord ref system using the EPSG code for MGA Zone 56 (see spatialreference.org)
+st_crs(dat.mga) <- 28356
+
+# Convert to lat-lon GDA94 (= WGS84, EPSG:4326)
+dat.latlon <- st_transform(dat.mga, 4326)
+
+# Mid-point and zoom (by trial and error) for base map
+x <- st_coordinates(dat.latlon)
+mid <- c(lon = mean(range(x[,1])), lat = mean(range(x[,2])))
+z <- 8
+
+# Background map
+suppressMessages(
+  basemap <- ggmap::get_map(source = "google", 
+                            location = mid, 
+                            zoom = z,
+                            maptype = "roadmap")
+)
+
+ggmap(basemap) +
+  geom_sf(data = dat.latlon, aes(colour = sitegroup), 
+          inherit.aes = FALSE, 
+          size = 2, show.legend = "point") +
+  
+  scale_color_brewer(palette = "Set1")
+
+```
+
+
+Save data to file.
+
+```{r}
+
+save(DAT.sites, file = here("data", "sites.RData") )
+
+```
+
